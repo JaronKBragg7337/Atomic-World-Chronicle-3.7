@@ -85,10 +85,9 @@ Atomic-World-Chronicle-3.7 https://github.com/JaronKBragg7337/Atomic-World-Chron
 https://jaronkbragg7337.github.io/persistent-memory-substrate/
 ***
 (https://github.com/JaronKBragg7337/ATOMIC-CHRONICLE-v4.0-A-World-You-Want-Or-a-World-of-Worlds)
-A-World-You-Want-Or-a-World-of-Worlds
 *⭐ Star this repo if you find it useful!*
 
 ***
 
-**Made with ❤️ for the future**  
-`atomic_chronicle_v4.py` — *A world you want, or a world of worlds.
+**for the future**  
+`atomicd_chronicle_v4.py` — *A world you want, or a world of worlds.

@@ -1,0 +1,1555 @@
+#!/usr/bin/env python3
+"""
+ATOMIC CHRONICLE v4.0 (A world you want or a world of worlds.)
+
+- Canonical Atomic Chronicle core (blocks, RUS, worlds, carrier)
+- Transparency Economy (optional)
+- Energy / Robotics / Game / DAO worlds
+- GameControl → RobotWorld → RewardWorld pipeline (Inter-World Causality)
+- OmniWorld Orchestrator (Meta-Control)
+- FastAPI / WebSocket Server (External Interface)
+
+This file is intentionally single‑file and offline‑capable.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import math
+import os
+import random
+import sqlite3
+import threading
+import time
+import uuid
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Callable, Tuple
+from threading import Lock
+
+# =====================================================
+# OPTIONAL DEPENDENCIES
+# =====================================================
+
+try:
+    import pygame
+    from pygame.locals import *
+    PYGAME_AVAILABLE = True
+except Exception:
+    pygame = None
+    PYGAME_AVAILABLE = False
+
+try:
+    import serial
+    SERIAL_AVAILABLE = True
+except Exception:
+    serial = None
+    SERIAL_AVAILABLE = False
+
+try:
+    from fastapi import FastAPI, WebSocket, Depends, HTTPException
+    from fastapi.middleware.cors import CORSMiddleware
+    import uvicorn
+    FASTAPI_AVAILABLE = True
+except Exception:
+    FASTAPI_AVAILABLE = False
+    print("[WARN] FastAPI not available. Server functionality disabled.")
+
+
+# =====================================================
+# AUTHORIZATION / ID TAGGING (Metadata only)
+# =====================================================
+
+def authorized_label(module_name: str, pattern: str = "AEIOU4x3") -> dict:
+    """
+    Symbolic ID tags for major subsystems or entities.
+    These are metadata only — they do not grant privileges.
+    """
+    return {
+        "module": module_name,
+        "authorization_pattern": pattern,
+        "issued_at": time.time(),
+    }
+
+CORE_ID = authorized_label("AtomicChronicleCore", "AEIOU4x3")
+
+
+# =====================================================
+# FEATURE TOGGLES (CONFIG + CLI + RUNTIME)
+# =====================================================
+
+DEFAULT_FEATURES: Dict[str, bool] = {
+    "enable_transparency": True,
+    "enable_energy_world": True,
+    "enable_flywheel_world": True,
+    "enable_windup_world": True,
+    "enable_robot_world": True,
+    "enable_game_world": True,
+    "enable_game_control_world": True,
+    "enable_reward_world": True,
+    "enable_mystery_world": True,
+    "enable_public_commons": True,
+    "enable_private_consortium": True,
+    "enable_carrier_heartbeat": False,
+    "enable_fastapi_server": True,
+    "enable_omni_world": True,
+}
+
+CONFIG_PATH = "atomic_chronicle_config.json"
+
+
+def load_features(config_path: str = CONFIG_PATH) -> Dict[str, bool]:
+    features = dict(DEFAULT_FEATURES)
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for k, v in data.items():
+                if k in features:
+                    features[k] = bool(v)
+        except Exception as e:
+            print(f"[WARN] Failed to load {config_path}: {e}")
+    return features
+
+
+def apply_cli_overrides(features: Dict[str, bool]) -> Dict[str, bool]:
+    parser = argparse.ArgumentParser(description="Atomic Chronicle v4.0")
+    parser.add_argument(
+        "--set-feature",
+        action="append",
+        default=[],
+        help="Override features: key=true|false (may repeat)",
+    )
+    parser.add_argument(
+        "--no-server",
+        action="store_true",
+        help="Disable FastAPI server regardless of config.",
+    )
+    args, _ = parser.parse_known_args()
+
+    for item in args.set_feature:
+        if "=" not in item:
+            continue
+        key, val = item.split("=", 1)
+        key = key.strip()
+        val = val.strip().lower()
+        if key not in features:
+            continue
+        if val in ("1", "true", "yes", "on"):
+            features[key] = True
+        elif val in ("0", "false", "no", "off"):
+            features[key] = False
+
+    if args.no_server:
+        features["enable_fastapi_server"] = False
+
+    return features
+
+
+RUNTIME_FEATURES: Dict[str, bool] = {}
+
+
+def set_feature_runtime(key: str, value: bool) -> None:
+    if key in RUNTIME_FEATURES:
+        RUNTIME_FEATURES[key] = value
+
+
+# =====================================================
+# UTILITIES / JSON / RUS
+# =====================================================
+
+def _dumps(o: Any) -> str:
+    return json.dumps(o, separators=(",", ":"), sort_keys=True, default=str)
+
+
+def rus_validate(inputs: Any, state: Any, receipt: Any) -> bool:
+    """
+    Reality Update Substrate (RUS) structural validation.
+    System enforces *structure*, not meaning.
+    """
+    return (
+        isinstance(inputs, dict)
+        and isinstance(state, dict)
+        and "_ts" in state
+        and isinstance(receipt, dict)
+        and "type" in receipt
+    )
+
+
+# =====================================================
+# BLOCK / LEDGER CORE
+# =====================================================
+
+@dataclass(frozen=True)
+class Block:
+    id: str
+    ts: float
+    prev: Optional[str]
+    world: str
+    runtime: str
+    inputs: str
+    state: str
+    receipt: str
+    witness: Optional[str]
+    nonce: str
+    cost: float
+
+
+def new_block(
+    *,
+    prev: Optional[str],
+    world: str,
+    runtime: str,
+    inputs: Any,
+    state: Any,
+    receipt: Any,
+    witness: Optional[Any] = None,
+    nonce: str = "0",
+    cost: float = 0.0,
+) -> Block:
+    return Block(
+        id=str(uuid.uuid4()),
+        ts=time.time(),
+        prev=prev,
+        world=world,
+        runtime=runtime,
+        inputs=_dumps(inputs),
+        state=_dumps(state),
+        receipt=_dumps(receipt),
+        witness=_dumps(witness) if witness is not None else None,
+        nonce=str(nonce),
+        cost=float(cost),
+    )
+
+
+# =====================================================
+# PERSISTENCE (SQLite)
+# =====================================================
+
+class Persistence:
+    def __init__(self, db: str = "atomic_unified.db"):
+        self.db = db
+        self.lock = threading.RLock()
+        self.token_price = 0.00001
+        self._init()
+
+    def _c(self) -> sqlite3.Connection:
+        c = sqlite3.connect(self.db, check_same_thread=False, isolation_level=None)
+        c.execute("PRAGMA journal_mode=WAL;")
+        return c
+
+    def _init(self) -> None:
+        with self._c() as c:
+            c.execute(
+                """CREATE TABLE IF NOT EXISTS blocks(
+                    id TEXT PRIMARY KEY,
+                    ts REAL,
+                    prev TEXT,
+                    world TEXT,
+                    runtime TEXT,
+                    inputs TEXT,
+                    state TEXT,
+                    receipt TEXT,
+                    witness TEXT,
+                    nonce TEXT,
+                    cost REAL
+                )"""
+            )
+            c.execute(
+                """CREATE TABLE IF NOT EXISTS wallets(
+                    id TEXT PRIMARY KEY,
+                    bal REAL
+                )"""
+            )
+
+    def wallet(self, pid: str) -> float:
+        with self._c() as c:
+            r = c.execute(
+                "SELECT bal FROM wallets WHERE id=?",
+                (pid,),
+            ).fetchone()
+            return r[0] if r else 0.0
+
+    def reward(self, pid: str, amt: float) -> None:
+        with self._c() as c:
+            c.execute(
+                """INSERT INTO wallets(id, bal) VALUES (?,?)
+                   ON CONFLICT(id) DO UPDATE SET bal=bal+excluded.bal""",
+                (pid, amt),
+            )
+
+    def charge(self, pid: str, cost: float) -> bool:
+        with self.lock, self._c() as c:
+            bal = self.wallet(pid)
+            if bal < cost:
+                return False
+            self.reward(pid, -cost)
+            return True
+
+    def head(self, world: str) -> Optional[str]:
+        with self._c() as c:
+            r = c.execute(
+                "SELECT id FROM blocks WHERE world=? ORDER BY ts DESC LIMIT 1",
+                (world,),
+            ).fetchone()
+            return r[0] if r else None
+
+    def append(self, b: Block) -> None:
+        with self.lock, self._c() as c:
+            c.execute(
+                "INSERT INTO blocks VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    b.id,
+                    b.ts,
+                    b.prev,
+                    b.world,
+                    b.runtime,
+                    b.inputs,
+                    b.state,
+                    b.receipt,
+                    b.witness,
+                    b.nonce,
+                    b.cost,
+                ),
+            )
+
+
+# =====================================================
+# TRANSPARENCY ECONOMY (Integrated Persistence)
+# =====================================================
+
+class TransparencyConsensus:
+    def __init__(self):
+        self.registrations: Dict[str, Dict[str, Any]] = {}
+        self.unknown_registry: Dict[str, Dict[str, Any]] = {}
+
+    def register_entity(
+        self,
+        entity_id: str,
+        transparency: str = "unknown",
+        willingness_to_reveal: float = 0.5,
+        terms: Optional[dict] = None,
+        registered_by: str = "system",
+    ) -> Dict[str, Any]:
+        if transparency not in ("public", "private", "unknown", "consensus_pending"):
+            transparency = "unknown"
+
+        reg = {
+            "transparency": transparency,
+            "willingness": float(willingness_to_reveal),
+            "terms": terms or {},
+            "registered_at": time.time(),
+            "reputation": 0.0,
+            "tokens_earned": 0.0,
+            "last_reveal_attempt": None,
+            "registered_by": registered_by,
+        }
+        self.registrations[entity_id] = reg
+
+        if transparency == "unknown":
+            self.unknown_registry[entity_id] = {
+                "excitement_level": random.uniform(0.7, 1.0),
+                "potential_value": random.uniform(100, 10_000),
+                "discovery_reward": 1000.0 * float(willingness_to_reveal),
+            }
+        return reg
+
+    def get_commercial_rights(self, entity_id: str, use_type: str) -> Dict[str, Any]:
+        reg = self.registrations.get(entity_id, {})
+        transparency = reg.get("transparency", "unknown")
+
+        if transparency == "public":
+            fee = reg.get("terms", {}).get("commercial", {}).get("fee_per_use", 0.0)
+            return {"commercial_allowed": True, "fee_tokens": fee}
+        if transparency == "private":
+            return {"commercial_allowed": True, "fee_tokens": 0.0}
+
+        return {"commercial_allowed": False, "fee_tokens": 0.0}
+
+    def attempt_reveal(self, entity_id: str, revealer_id: str, evidence: dict) -> Dict[str, Any]:
+        if entity_id not in self.unknown_registry:
+            return {"success": False, "reason": "Entity not unknown or already revealed."}
+
+        unknown = self.unknown_registry[entity_id]
+        success_chance = (len(_dumps(evidence)) / 1000.0) * unknown["excitement_level"] * 0.5
+
+        if random.random() < success_chance:
+            reward = unknown["discovery_reward"]
+            reg = self.registrations[entity_id]
+            reg["transparency"] = "public"
+            reg["reputation"] = 0.1
+            del self.unknown_registry[entity_id]
+
+            return {
+                "success": True,
+                "reward_tokens": reward,
+                "new_transparency": "public",
+                "message": f"Entity {entity_id} successfully revealed.",
+            }
+
+        self.registrations[entity_id]["last_reveal_attempt"] = time.time()
+        unknown["excitement_level"] = min(1.0, unknown["excitement_level"] + 0.1)
+        return {"success": False, "reason": "Insufficient evidence or poor timing."}
+
+
+class TransparencyEconomy(Persistence):
+    def __init__(self, db: str = "atomic_unified.db"):
+        super().__init__(db)
+        self.transparency = TransparencyConsensus()
+        self.commercial_ledger: Dict[str, float] = {}
+
+        self.transparency_multipliers = {
+            "public": 1.0,
+            "private": 0.3,
+            "unknown": 0.0,
+            "consensus_pending": 0.1,
+        }
+
+    def reward_with_transparency(
+        self, pid: str, amt: float, entity_id: Optional[str] = None
+    ) -> float:
+        if entity_id is None:
+            super().reward(pid, amt)
+            return amt
+
+        reg = self.transparency.registrations.get(entity_id, {})
+        transparency = reg.get("transparency", "unknown")
+        mult = self.transparency_multipliers.get(transparency, 0.0)
+        actual = amt * mult
+
+        if actual > 0.0:
+            super().reward(pid, actual)
+
+        return actual
+
+    def charge_with_transparency(
+        self, pid: str, cost: float, entity_id: Optional[str] = None
+    ) -> bool:
+        total = cost
+        if entity_id:
+            rights = self.transparency.get_commercial_rights(entity_id, "usage")
+            if not rights.get("commercial_allowed", False):
+                return False
+            fee = rights.get("fee_tokens", 0.0)
+            if fee > 0.0:
+                owner = self.transparency.registrations.get(entity_id, {}).get("registered_by", "system")
+                super().reward(owner, fee)
+            total = cost + fee
+        return super().charge(pid, total)
+
+    def reveal_entity(
+        self, entity_id: str, revealer_id: str, evidence: Optional[dict] = None
+    ) -> Dict[str, Any]:
+        res = self.transparency.attempt_reveal(entity_id, revealer_id, evidence or {})
+        if res.get("success"):
+            reward = res.get("reward_tokens", 1000.0)
+            super().reward(revealer_id, reward)
+            res["commercial_status"] = "now_available"
+        return res
+
+
+# =====================================================
+# WORLD BASE CLASSES
+# =====================================================
+
+class World:
+    def __init__(
+        self,
+        name: str,
+        persist: Persistence,
+        player: str,
+        runtime: str,
+        charge: bool = False,
+    ):
+        self.name = name
+        self.p = persist
+        self.pid = player
+        self.runtime = runtime
+        self.charge = charge
+        self.state: Dict[str, Any] = {"_ts": time.time()}
+        self.subs: List[Callable[[Block], None]] = []
+        self.carrier: Optional[Carrier] = None
+
+    def subscribe(self, fn: Callable[[Block], None]) -> None:
+        self.subs.append(fn)
+
+    def cost(self, i: Any) -> float:
+        if isinstance(self.p, TransparencyEconomy) and i.get("entity_id"):
+            return len(_dumps(i).encode()) * self.p.token_price
+        return len(_dumps(i).encode()) * self.p.token_price if self.charge else 0.0
+
+    def execute_logic(self, i: Any) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        ts = time.time()
+        s = dict(self.state, _ts=ts)
+        if isinstance(i, dict):
+            s.update(i)
+        r = {"type": f"{self.name}_event", "ts": ts}
+        return s, r
+
+    def step(self, i: Dict[str, Any], witness: Optional[Dict[str, Any]] = None) -> Block:
+        c = self.cost(i)
+        
+        if c and self.charge:
+            if isinstance(self.p, TransparencyEconomy):
+                charged = self.p.charge_with_transparency(self.pid, c, i.get("entity_id"))
+            else:
+                charged = self.p.charge(self.pid, c)
+            
+            if not charged:
+                raise ValueError(f"Insufficient tokens for player {self.pid}")
+
+        prev = self.p.head(self.name)
+        s, r = self.execute_logic(i)
+
+        if not rus_validate(i, s, r):
+            raise ValueError("RUS validation failed")
+            
+        b = new_block(
+            prev=prev,
+            world=self.name,
+            runtime=self.runtime,
+            inputs=i,
+            state=s,
+            receipt=r,
+            witness=witness,
+            cost=c,
+        )
+        
+        self.state = s
+        self.p.append(b)
+        
+        for fn in self.subs:
+            try:
+                fn(b)
+            except Exception as e:
+                print(f"[WARN] subscriber failed in world {self.name}: {e}")
+                
+        return b
+
+
+class TransparencyAwareWorld(World):
+    def __init__(
+        self,
+        name: str,
+        persist: Persistence,
+        player: str,
+        runtime: str,
+        charge: bool = False,
+        transparency_mode: str = "public",
+    ):
+        super().__init__(name, persist, player, runtime, charge)
+        if not isinstance(persist, TransparencyEconomy):
+            raise TypeError("TransparencyAwareWorld requires TransparencyEconomy persistence")
+        self.transparency_mode = transparency_mode
+
+
+# =====================================================
+# DOMAIN WORLDS
+# =====================================================
+
+class EnergyHarvesterWorld(World):
+    def __init__(self, p: Persistence):
+        super().__init__("EnergyHarvesterWorld", p, "harvester", "EnergyHarvester", True)
+        self.total = 0.0
+        self.state = {"total_kwh": self.total, "_ts": time.time()}
+
+    def execute_logic(self, i: Dict[str, Any]):
+        ts = time.time()
+        e = float(i.get("energy_produced_kwh", 0.0))
+        self.total += e
+        s = {"total_kwh": self.total, "_ts": ts}
+        r = {"type": "energy_output", "ts": ts, "kwh": e}
+        return s, r
+
+
+class FlywheelPlantWorld(World):
+    def __init__(self, p: Persistence):
+        super().__init__("FlywheelPlantWorld", p, "plant_ops", "FlywheelPlant", True)
+        self.state = {
+            "rpm": 0.0,
+            "stored_kwh": 0.0,
+            "mode": "idle",
+            "last_cmd": None,
+            "_ts": time.time(),
+        }
+    
+    def execute_logic(self, i: Dict[str, Any]):
+        ts = time.time()
+        s = dict(self.state, _ts=ts)
+        cmd = i.get("cmd")
+
+        if cmd == "set_mode":
+            new_mode = i.get("mode", s["mode"])
+            s["mode"] = new_mode if new_mode in ("idle", "charge", "discharge", "fault") else "fault"
+        elif cmd == "adjust_rpm":
+            rpm_delta = float(i.get("rpm_delta", 0.0))
+            s["rpm"] = max(0.0, s["rpm"] + rpm_delta)
+        elif cmd == "store_energy":
+            energy = float(i.get("energy_kwh", 0.0))
+            s["stored_kwh"] += energy
+            s["rpm"] = min(10000.0, s["rpm"] + energy * 1000.0)
+        elif cmd == "release_energy":
+            requested = float(i.get("energy_kwh", 0.0))
+            released = min(requested, s["stored_kwh"])
+            s["stored_kwh"] -= released
+            s["rpm"] = max(0.0, s["rpm"] - released * 500.0)
+            if s["stored_kwh"] <= 0:
+                s["mode"] = "idle"
+
+        s["last_cmd"] = cmd
+        r = {
+            "type": "flywheel_event",
+            "ts": ts,
+            "cmd": cmd,
+            "rpm": s["rpm"],
+            "stored_kwh": s["stored_kwh"],
+            "mode": s["mode"]
+        }
+        return s, r
+
+
+class WindupGeneratorWorld(World):
+    def __init__(self, p: Persistence):
+        super().__init__("WindupGeneratorWorld", p, "windup_ops", "WindupGenerator", True)
+        self.state = {
+            "spring_tension": 0.0,
+            "energy_output": 0.0,
+            "wound_up": False,
+            "cycles_completed": 0,
+            "_ts": time.time()
+        }
+    
+    def execute_logic(self, i: Dict[str, Any]):
+        ts = time.time()
+        s = dict(self.state, _ts=ts)
+        
+        if i.get("action") == "wind":
+            force = i.get("force", 10.0)
+            s["spring_tension"] = min(100.0, s["spring_tension"] + force)
+            s["wound_up"] = s["spring_tension"] >= 80.0
+        elif i.get("action") == "release":
+            if s["wound_up"]:
+                s["energy_output"] = s["spring_tension"] * 0.8
+                s["spring_tension"] = 0.0
+                s["wound_up"] = False
+                s["cycles_completed"] += 1
+        elif i.get("action") == "reset":
+            s["spring_tension"] = 0.0
+            s["energy_output"] = 0.0
+            s["wound_up"] = False
+        
+        r = {
+            "type": "windup_event",
+            "ts": ts,
+            "action": i.get("action"),
+            "tension": s["spring_tension"],
+            "output": s["energy_output"],
+            "wound_up": s["wound_up"]
+        }
+        return s, r
+
+
+class AsteroidsGameWorld(World):
+    def __init__(self, p: Persistence):
+        super().__init__("AsteroidsGameWorld", p, "player", "Asteroids", True)
+        self.state = {
+            "score": 0,
+            "level": 1,
+            "ships": 3,
+            "asteroids_destroyed": 0,
+            "position": {"x": 400, "y": 300},
+            "velocity": {"dx": 0, "dy": 0},
+            "_ts": time.time()
+        }
+    
+    def execute_logic(self, i: Dict[str, Any]):
+        ts = time.time()
+        s = dict(self.state, _ts=ts)
+        action = i.get("action")
+        
+        if action == "rotate":
+            # Simulate rotation
+            s["velocity"]["dx"] += random.uniform(-2, 2)
+            s["velocity"]["dy"] += random.uniform(-2, 2)
+        elif action == "thrust":
+            s["velocity"]["dx"] += random.uniform(-1, 3)
+            s["velocity"]["dy"] += random.uniform(-1, 3)
+        elif action == "fire":
+            if random.random() > 0.7:  # 70% hit chance
+                s["asteroids_destroyed"] += 1
+                s["score"] += 100 * s["level"]
+                if s["asteroids_destroyed"] % 10 == 0:
+                    s["level"] += 1
+        elif action == "hit":
+            s["ships"] -= 1
+            if s["ships"] <= 0:
+                s["ships"] = 3
+                s["score"] = max(0, s["score"] - 500)
+        
+        # Update position
+        s["position"]["x"] = (s["position"]["x"] + s["velocity"]["dx"]) % 800
+        s["position"]["y"] = (s["position"]["y"] + s["velocity"]["dy"]) % 600
+        
+        r = {
+            "type": "asteroids_event",
+            "ts": ts,
+            "action": action,
+            "score": s["score"],
+            "ships": s["ships"],
+            "position": s["position"]
+        }
+        return s, r
+
+
+class MysteryTechnologyWorld(World):
+    def __init__(self, p: Persistence):
+        super().__init__("MysteryTechnologyWorld", p, "researcher", "MysteryTech", True)
+        self.state = {
+            "discovery_progress": 0.0,
+            "anomaly_level": 1.0,
+            "active_experiments": [],
+            "breakthroughs": [],
+            "_ts": time.time()
+        }
+    
+    def execute_logic(self, i: Dict[str, Any]):
+        ts = time.time()
+        s = dict(self.state, _ts=ts)
+        exp = i.get("experiment")
+        
+        if exp == "scan":
+            s["discovery_progress"] += random.uniform(0.01, 0.1)
+            s["anomaly_level"] *= random.uniform(0.95, 1.05)
+        elif exp == "probe":
+            if random.random() < 0.3:
+                breakthrough = f"breakthrough_{int(time.time())}"
+                s["breakthroughs"].append(breakthrough)
+                s["discovery_progress"] += 0.5
+        elif exp == "stabilize":
+            s["anomaly_level"] = max(0.1, s["anomaly_level"] * 0.8)
+        
+        if s["discovery_progress"] >= 1.0:
+            s["discovery_progress"] = 1.0
+            # Discovery complete!
+        
+        r = {
+            "type": "mystery_event",
+            "ts": ts,
+            "experiment": exp,
+            "progress": s["discovery_progress"],
+            "anomaly": s["anomaly_level"],
+            "breakthroughs": len(s["breakthroughs"])
+        }
+        return s, r
+
+
+class PublicCommonsWorld(TransparencyAwareWorld):
+    def __init__(self, p: Persistence):
+        super().__init__("PublicCommonsWorld", p, "commons", "PublicCommons", False, "public")
+        self.state = {
+            "public_resources": [],
+            "contribution_count": 0,
+            "last_contribution": None,
+            "_ts": time.time()
+        }
+    
+    def execute_logic(self, i: Dict[str, Any]):
+        ts = time.time()
+        s = dict(self.state, _ts=ts)
+        action = i.get("action")
+        
+        if action == "contribute":
+            resource = i.get("resource")
+            if resource:
+                s["public_resources"].append({
+                    "id": str(uuid.uuid4()),
+                    "resource": resource,
+                    "contributor": i.get("contributor", "anonymous"),
+                    "ts": ts
+                })
+                s["contribution_count"] += 1
+                s["last_contribution"] = ts
+        elif action == "access":
+            # Public access always allowed
+            pass
+        
+        r = {
+            "type": "commons_event",
+            "ts": ts,
+            "action": action,
+            "resources_count": len(s["public_resources"]),
+            "contributions": s["contribution_count"]
+        }
+        return s, r
+
+
+class PrivateConsortiumWorld(TransparencyAwareWorld):
+    def __init__(self, p: Persistence):
+        super().__init__("PrivateConsortiumWorld", p, "consortium", "PrivateConsortium", True, "private")
+        self.members = ["member1", "member2", "member3"]
+        self.state = {
+            "proposals": [],
+            "votes": {},
+            "treasury": 10000.0,
+            "active_members": len(self.members),
+            "_ts": time.time()
+        }
+    
+    def execute_logic(self, i: Dict[str, Any]):
+        ts = time.time()
+        s = dict(self.state, _ts=ts)
+        action = i.get("action")
+        
+        if action == "propose":
+            proposal = {
+                "id": str(uuid.uuid4()),
+                "title": i.get("title", "Untitled"),
+                "description": i.get("description", ""),
+                "proposer": i.get("member"),
+                "ts": ts,
+                "votes_for": 0,
+                "votes_against": 0,
+                "status": "pending"
+            }
+            s["proposals"].append(proposal)
+        elif action == "vote":
+            proposal_id = i.get("proposal_id")
+            vote = i.get("vote")
+            for prop in s["proposals"]:
+                if prop["id"] == proposal_id and prop["status"] == "pending":
+                    if vote == "for":
+                        prop["votes_for"] += 1
+                    elif vote == "against":
+                        prop["votes_against"] += 1
+                    
+                    if prop["votes_for"] >= 2:  # Majority of 3 members
+                        prop["status"] = "approved"
+                    elif prop["votes_against"] >= 2:
+                        prop["status"] = "rejected"
+        
+        r = {
+            "type": "consortium_event",
+            "ts": ts,
+            "action": action,
+            "proposals_count": len(s["proposals"]),
+            "treasury": s["treasury"]
+        }
+        return s, r
+
+
+# =====================================================
+# GAME CONTROL → ROBOT → REWARD PIPELINE (CRITICAL)
+# =====================================================
+
+class GameControlWorld(World):
+    """
+    Bridges gamer input to robot commands.
+    """
+    def __init__(self, p: Persistence, player: str = "player1"):
+        super().__init__("GameControlWorld", p, player, "GameControl", True)
+        self.state = {
+            "last_action": None,
+            "last_command": None,
+            "last_job_id": None,
+            "total_commands": 0,
+            "_ts": time.time(),
+        }
+
+    def execute_logic(self, i: Dict[str, Any]):
+        ts = time.time()
+        s = dict(self.state, _ts=ts)
+
+        action = i.get("action")
+        job_id = i.get("job_id", str(uuid.uuid4()))
+
+        cmd = None
+        if action == "move_forward":
+            cmd = {"type": "move", "direction": "forward", "distance": i.get("distance", 0.5)}
+        elif action == "move_backward":
+            cmd = {"type": "move", "direction": "backward", "distance": i.get("distance", 0.5)}
+        elif action == "turn_left":
+            cmd = {"type": "rotate", "direction": "left", "degrees": i.get("degrees", 90)}
+        elif action == "turn_right":
+            cmd = {"type": "rotate", "direction": "right", "degrees": i.get("degrees", 90)}
+        elif action == "pick_up":
+            cmd = {"type": "grab", "object": i.get("object", "unknown")}
+        elif action == "drop":
+            cmd = {"type": "release", "object": i.get("object", "unknown")}
+        elif action == "activate":
+            cmd = {"type": "activate", "device": i.get("device", "unknown")}
+
+        s["last_action"] = action
+        s["last_command"] = cmd
+        s["last_job_id"] = job_id
+        s["total_commands"] += 1
+
+        receipt = {
+            "type": "game_control_event",
+            "ts": ts,
+            "player": self.pid,
+            "action": action,
+            "job_id": job_id,
+            "robot_command": cmd,
+        }
+        return s, receipt
+
+
+class RobotWorld(World):
+    """
+    Robot controller. Receives commands.
+    """
+    def __init__(self, p: Persistence, port: str = "/dev/ttyUSB0"):
+        super().__init__("RobotWorld", p, "robot", "Robot")
+        self.ser = None
+        if SERIAL_AVAILABLE and port:
+            try:
+                self.ser = serial.Serial(port, 9600, timeout=1)
+            except:
+                print(f"[WARN] Could not open serial port {port}")
+        self.state = {
+            "last_cmd": None,
+            "last_job_id": None,
+            "last_status": "idle",
+            "last_player": None,
+            "total_jobs": 0,
+            "successful_jobs": 0,
+            "_ts": time.time(),
+        }
+
+    def execute_logic(self, i: Dict[str, Any]):
+        ts = time.time()
+        s = dict(self.state, _ts=ts)
+        r: Dict[str, Any] = {"type": "robot_action", "ts": ts}
+
+        cmd = i.get("command")
+        job_id = i.get("job_id")
+        status = i.get("status", "pending")
+        player = i.get("player") 
+
+        s["last_cmd"] = cmd
+        s["last_job_id"] = job_id
+        s["last_status"] = status
+        s["last_player"] = player
+        s["total_jobs"] += 1
+        
+        if status == "completed":
+            s["successful_jobs"] += 1
+            
+        # Simulate sending to actual robot hardware
+        if self.ser and cmd and status == "pending":
+            try:
+                cmd_str = json.dumps(cmd)
+                self.ser.write(cmd_str.encode() + b'\n')
+                # Simulate robot processing time
+                time.sleep(0.1)
+                status = "executing"
+            except Exception as e:
+                print(f"[WARN] Robot serial communication failed: {e}")
+                status = "failed"
+
+        r["command"] = cmd
+        r["job_id"] = job_id
+        r["status"] = status
+        r["player"] = player
+        
+        return s, r
+
+    def handle_game_block(self, b: Block):
+        receipt = json.loads(b.receipt)
+        if receipt.get("type") != "game_control_event":
+            return
+        cmd = receipt.get("robot_command")
+        job_id = receipt.get("job_id")
+        player = receipt.get("player")
+        if cmd is None:
+            return
+            
+        print(f"[CARRIER] RobotWorld received command for job {job_id} from {player}")
+        self.step(
+            {
+                "command": cmd,
+                "job_id": job_id,
+                "status": "pending",
+                "player": player,
+            }
+        )
+
+
+class RewardWorld(World):
+    """
+    Pays players when robot jobs complete.
+    """
+    def __init__(self, p: Persistence, runtime: str = "RewardEngine"):
+        super().__init__("RewardWorld", p, "reward_system", runtime, False)
+        self.state = {
+            "total_rewards_issued": 0.0, 
+            "total_transactions": 0,
+            "last_reward": None,
+            "_ts": time.time()
+        }
+
+    def execute_logic(self, i: Dict[str, Any]):
+        ts = time.time()
+        s = dict(self.state, _ts=ts)
+        receipt = {
+            "type": "reward_event",
+            "ts": ts,
+            "player_id": i.get("player_id"),
+            "amount": i.get("amount"),
+            "job_id": i.get("job_id"),
+            "reason": i.get("reason", "robot_completion"),
+        }
+        amount = i.get("amount", 0.0)
+        s["total_rewards_issued"] += amount
+        s["total_transactions"] += 1
+        s["last_reward"] = ts
+        return s, receipt
+
+    def reward_player(self, player_id: str, amount: float, job_id: Optional[str] = None, reason: str = "robot_completion"):
+        self.p.reward(player_id, amount)
+        self.step(
+            {
+                "event": "reward",
+                "player_id": player_id,
+                "amount": amount,
+                "job_id": job_id,
+                "reason": reason,
+            }
+        )
+
+    def handle_robot_block(self, b: Block):
+        receipt = json.loads(b.receipt)
+        if receipt.get("type") != "robot_action":
+            return
+        status = receipt.get("status")
+        job_id = receipt.get("job_id")
+        player = receipt.get("player")
+        
+        if status == "completed" and player:
+            print(f"[CARRIER] RewardWorld rewarding {player} for completed job {job_id}")
+            self.reward_player(player, amount=10.0, job_id=job_id, reason="robot_job_completed")
+
+
+# =====================================================
+# OMNIWORLD — MULTI‑WORLD ORCHESTRATOR
+# =====================================================
+
+class OmniWorld(World):
+    """
+    OmniWorld: multi‑world orchestrator.
+    Routes commands via the Carrier to target worlds.
+    """
+
+    def __init__(
+        self,
+        p: Persistence,
+        carrier,
+        player: str = "omni_admin",
+        runtime: str = "OmniWorld",
+        enabled: bool = True,
+    ):
+        super().__init__("OmniWorld", p, player, runtime, False)
+        self.carrier = carrier
+        self.enabled = enabled
+        
+        self.modules: Dict[str, bool] = {}
+        for name in carrier.w.keys():
+            if name != "OmniWorld":
+                self.modules[name] = True
+        
+        self.state.update(
+            {
+                "enabled": self.enabled,
+                "modules": dict(self.modules),
+                "last_route": None,
+                "routes_completed": 0,
+                "_ts": time.time(),
+            }
+        )
+        
+    def _set_enabled(self, value: bool):
+        self.enabled = value
+        print(f"[OmniWorld] {'Enabled' if value else 'Disabled'}")
+
+    def _set_module(self, name: str, value: bool):
+        if name in self.modules:
+            self.modules[name] = value
+            print(f"[OmniWorld] Module {name} {'enabled' if value else 'disabled'}")
+
+    def execute_logic(self, i: Dict[str, Any]):
+        ts = time.time()
+        s = dict(self.state, _ts=ts)
+        op = i.get("op", "route")
+        r: Dict[str, Any] = {"type": "omni_event", "ts": ts, "op": op}
+
+        if op == "set_enabled":
+            value = bool(i.get("value", True))
+            self._set_enabled(value)
+            r["enabled"] = self.enabled
+            s["enabled"] = self.enabled
+            return s, r
+        
+        if op == "set_module":
+            mod = i.get("module")
+            value = bool(i.get("value", True))
+            if isinstance(mod, str) and mod in self.modules:
+                self._set_module(mod, value)
+                r["module"] = mod
+                r["value"] = value
+                s["modules"] = dict(self.modules)
+            return s, r
+
+        if op == "route":
+            target_name = i.get("target_world")
+            payload = i.get("payload", {})
+            s["last_route"] = {"target_world": target_name, "ts": ts}
+
+            if not self.enabled:
+                r["status"] = "omniworld_disabled"
+                return s, r
+                
+            if not self.modules.get(target_name, False):
+                r["status"] = "module_disabled"
+                return s, r
+
+            target_world = self.carrier.get(target_name)
+            if target_world is None:
+                r["status"] = "target_not_found"
+                return s, r
+
+            try:
+                target_block = target_world.step(payload)
+                r["status"] = "routed_successfully"
+                r["target_block_id"] = target_block.id
+                r["target_world"] = target_name
+                s["routes_completed"] += 1
+            except Exception as e:
+                r["status"] = "route_failed"
+                r["error"] = str(e)
+
+            return s, r
+
+        r["status"] = "unknown_op"
+        return s, r
+
+
+# =====================================================
+# CARRIER (BLOCK BUS) (CRITICAL)
+# =====================================================
+
+class Carrier:
+    """
+    Block-level broadcast bus responsible for inter-world causality.
+    """
+    def __init__(self):
+        self.w: Dict[str, World] = {}
+
+    def reg(self, w: World) -> None:
+        self.w[w.name] = w
+
+    def get(self, name: str) -> Optional[World]:
+        return self.w.get(name)
+
+    def broadcast_block(self, b: Block) -> None:
+        world_name = b.world
+
+        # Pipeline 1: Game Control -> Robot
+        if world_name == "GameControlWorld":
+            robot_world = self.get("RobotWorld")
+            if isinstance(robot_world, RobotWorld):
+                robot_world.handle_game_block(b)
+
+        # Pipeline 2: Robot -> Reward
+        if world_name == "RobotWorld":
+            reward_world = self.get("RewardWorld")
+            if isinstance(reward_world, RewardWorld):
+                reward_world.handle_robot_block(b)
+                
+        # Pipeline 3: Energy -> Flywheel
+        if world_name == "EnergyHarvesterWorld":
+            flywheel_world = self.get("FlywheelPlantWorld")
+            if isinstance(flywheel_world, FlywheelPlantWorld):
+                # Automatically store energy in flywheel
+                receipt = json.loads(b.receipt)
+                if receipt.get("type") == "energy_output":
+                    energy = receipt.get("kwh", 0.0)
+                    if energy > 0:
+                        flywheel_world.step({
+                            "cmd": "store_energy",
+                            "energy_kwh": energy * 0.8  # 80% efficiency
+                        })
+
+
+def wrap_world_step(world: World, carrier: Carrier):
+    orig_step = world.step
+    world.carrier = carrier
+
+    def wrapped(i: Dict[str, Any], witness: Optional[Dict[str, Any]] = None):
+        b = orig_step(i, witness)
+        carrier.broadcast_block(b)
+        return b
+
+    world.step = wrapped  # type: ignore[attr-defined]
+
+
+# =====================================================
+# FASTAPI SERVER WITH THREAD-SAFE WEBSOCKETS
+# =====================================================
+
+class WebSocketManager:
+    def __init__(self):
+        self.subscribers: List[WebSocket] = []
+        self.lock = Lock()
+    
+    def add(self, ws: WebSocket):
+        with self.lock:
+            self.subscribers.append(ws)
+    
+    def remove(self, ws: WebSocket):
+        with self.lock:
+            if ws in self.subscribers:
+                self.subscribers.remove(ws)
+    
+    def get_all(self) -> List[WebSocket]:
+        with self.lock:
+            return list(self.subscribers)
+
+
+def build_fastapi_app(
+    carrier: Carrier,
+    persistence: Persistence,
+    features: Dict[str, bool],
+) -> FastAPI:
+    
+    app = FastAPI(title="Atomic Chronicle v4.0", version="4.0")
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    
+    ws_manager = WebSocketManager()
+    
+    def get_world(world_name: str) -> World:
+        w = carrier.get(world_name)
+        if w is None:
+            raise HTTPException(status_code=404, detail=f"World '{world_name}' not found")
+        return w
+
+    @app.get("/")
+    def root():
+        return {
+            "message": "Atomic Chronicle Unified Ecosystem Online",
+            "worlds": list(carrier.w.keys()),
+            "features": RUNTIME_FEATURES,
+            "timestamp": time.time(),
+        }
+
+    @app.get("/health")
+    async def health_check():
+        return {
+            "status": "healthy",
+            "worlds": {name: "online" for name in carrier.w.keys()},
+            "timestamp": time.time(),
+            "block_counts": {},
+            "version": "4.0"
+        }
+
+    @app.get("/config")
+    async def get_configuration():
+        return {
+            "features": RUNTIME_FEATURES,
+            "worlds": list(carrier.w.keys()),
+            "transparency_enabled": isinstance(persistence, TransparencyEconomy),
+            "carrier_pipelines": [
+                "GameControlWorld → RobotWorld → RewardWorld",
+                "EnergyHarvesterWorld → FlywheelPlantWorld"
+            ],
+            "server_time": time.time()
+        }
+
+    @app.get("/wallet/{pid}")
+    def get_wallet(pid: str):
+        return {"pid": pid, "balance": persistence.wallet(pid)}
+
+    @app.post("/worlds/{world_name}/step")
+    async def step_world(world_name: str, data: Dict[str, Any], w: World = Depends(get_world)):
+        try:
+            blk = w.step(data)
+            return {
+                "block_id": blk.id,
+                "world": w.name,
+                "world_state": w.state,
+                "receipt": json.loads(blk.receipt),
+                "cost": blk.cost,
+            }
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.post("/toggle/{feature_key}")
+    async def toggle_feature(feature_key: str, body: Dict[str, Any]):
+        if feature_key not in RUNTIME_FEATURES:
+            raise HTTPException(status_code=404, detail=f"Unknown feature {feature_key}")
+        value = bool(body.get("value", True))
+        set_feature_runtime(feature_key, value)
+        return {"feature": feature_key, "value": value}
+
+    @app.get("/worlds/{world_name}/state")
+    async def get_world_state(world_name: str, w: World = Depends(get_world)):
+        return {
+            "world": w.name,
+            "state": w.state,
+            "player": w.pid,
+            "runtime": w.runtime
+        }
+
+    # WebSocket Setup
+    async def notify_subscribers(message: dict):
+        for ws in ws_manager.get_all():
+            try:
+                await ws.send_json(message)
+            except Exception:
+                ws_manager.remove(ws)
+
+    def forwarder(block: Block):
+        msg = {
+            "type": "NEW_BLOCK",
+            "world": block.world,
+            "block_id": block.id,
+            "ts": block.ts,
+            "cost": block.cost,
+            "prev": block.prev,
+            "receipt": json.loads(block.receipt),
+        }
+        try:
+            loop = asyncio.get_event_loop()
+            asyncio.run_coroutine_threadsafe(notify_subscribers(msg), loop)
+        except RuntimeError:
+            pass
+
+    # Subscribe all worlds to the forwarder
+    for w in carrier.w.values():
+        w.subscribe(forwarder)
+
+    @app.websocket("/ws")
+    async def websocket_feed(ws: WebSocket):
+        await ws.accept()
+        ws_manager.add(ws)
+        await ws.send_json({"welcome": "Connected to Atomic Chronicle v4.0 stream", "worlds": list(carrier.w.keys())})
+        try:
+            while True:
+                await ws.receive_text()
+        finally:
+            ws_manager.remove(ws)
+
+    # Optional: OmniWorld control endpoint
+    @app.post("/omni/route")
+    async def omni_route(data: Dict[str, Any]):
+        omni_world = carrier.get("OmniWorld")
+        if not omni_world:
+            raise HTTPException(status_code=404, detail="OmniWorld not found")
+        
+        try:
+            block = omni_world.step({
+                "op": "route",
+                "target_world": data.get("target_world"),
+                "payload": data.get("payload", {})
+            })
+            return {
+                "status": "success",
+                "block_id": block.id,
+                "receipt": json.loads(block.receipt)
+            }
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    return app
+
+
+# =====================================================
+# MAIN INITIALIZATION (CRITICAL)
+# =====================================================
+
+def main():
+    print("\n=== ATOMIC CHRONICLE ECOSYSTEM v4.0 ===\n")
+    print("Initializing with inter-world causality pipelines...\n")
+
+    # 1) Load features
+    features = load_features(CONFIG_PATH)
+    features = apply_cli_overrides(features)
+
+    RUNTIME_FEATURES.clear()
+    RUNTIME_FEATURES.update(features)
+
+    # 2) Choose persistence
+    if features.get("enable_transparency", True):
+        persistence: Persistence = TransparencyEconomy("atomic_unified.db")
+        print("[INIT] Using Transparency Economy with commercial rights")
+    else:
+        persistence = Persistence("atomic_unified.db")
+        print("[INIT] Using standard persistence")
+        
+    carrier = Carrier()
+    world_list: List[World] = []
+
+    # 3) Instantiate worlds
+    if features["enable_energy_world"]:
+        world_list.append(EnergyHarvesterWorld(persistence))
+    if features["enable_flywheel_world"]:
+        world_list.append(FlywheelPlantWorld(persistence))
+    if features["enable_windup_world"]:
+        world_list.append(WindupGeneratorWorld(persistence))
+    if features["enable_robot_world"]:
+        world_list.append(RobotWorld(persistence))
+    if features["enable_game_control_world"]:
+        world_list.append(GameControlWorld(persistence, player="player1"))
+    if features["enable_reward_world"]:
+        world_list.append(RewardWorld(persistence))
+    if features["enable_game_world"]:
+        world_list.append(AsteroidsGameWorld(persistence))
+    if features["enable_mystery_world"]:
+        world_list.append(MysteryTechnologyWorld(persistence))
+    if features["enable_public_commons"]:
+        world_list.append(PublicCommonsWorld(persistence))
+    if features["enable_private_consortium"]:
+        world_list.append(PrivateConsortiumWorld(persistence))
+
+    # Register worlds with carrier
+    for w in world_list:
+        carrier.reg(w)
+
+    # Instantiate OmniWorld (requires existing carrier.w keys)
+    if features.get("enable_omni_world", True):
+        omni_world = OmniWorld(persistence, carrier)
+        carrier.reg(omni_world)
+        world_list.append(omni_world)
+
+    # Wrap steps (Crucial for pipeline activation)
+    for w in world_list:
+        wrap_world_step(w, carrier)
+
+    print(f"[INIT] Worlds registered: {', '.join(carrier.w.keys())}")
+    print(f"[INIT] Active pipelines: GameControl→Robot→Reward, Energy→Flywheel")
+
+    # Seed initial balance
+    persistence.reward("player1", 1000.0)
+    print(f"[INIT] Seeded player1 with 1000.0 tokens")
+
+    # 4) Enhanced Pipeline Demo
+    print("\n" + "="*60)
+    print("DEMONSTRATING GAMECONTROL → ROBOT → REWARD PIPELINE")
+    print("="*60)
+    
+    game_control_world = carrier.get("GameControlWorld")
+    robot_world = carrier.get("RobotWorld")
+    reward_world = carrier.get("RewardWorld")
+    
+    if game_control_world and robot_world and reward_world:
+        initial_balance = persistence.wallet('player1')
+        print(f"\n1. Starting balance: {initial_balance:.2f}")
+        
+        # Subscribe to see pipeline in action
+        def pipeline_debug(block: Block):
+            receipt = json.loads(block.receipt)
+            if block.world == "GameControlWorld":
+                print(f"   ↳ GameControl: {receipt.get('action')} → job:{receipt.get('job_id')[:8]}")
+            elif block.world == "RobotWorld":
+                print(f"   ↳ RobotWorld: {receipt.get('status')} for job:{receipt.get('job_id')[:8]}")
+            elif block.world == "RewardWorld":
+                print(f"   ↳ RewardWorld: +{receipt.get('amount', 0):.1f} to {receipt.get('player_id')}")
+        
+        for world in [game_control_world, robot_world, reward_world]:
+            world.subscribe(pipeline_debug)
+        
+        # A) Player sends command (triggers pipeline)
+        print("\n2. Player sends 'move_forward' command...")
+        try:
+            game_block = game_control_world.step(
+                {"action": "move_forward", "distance": 1.0}
+            )
+            print(f"   GameControl block created: {game_block.id[:8]}...")
+        except Exception as e:
+            print(f"   Error: {e}")
+        
+        # Small delay to let pipeline process
+        time.sleep(0.2)
+        
+        # B) Check robot state
+        print(f"\n3. Robot state after pipeline:")
+        print(f"   Last job: {robot_world.state.get('last_job_id', 'None')}")
+        print(f"   Last status: {robot_world.state.get('last_status', 'None')}")
+        
+        # C) Manually trigger robot completion to demonstrate full pipeline
+        if robot_world.state.get('last_job_id'):
+            print(f"\n4. Simulating robot completion...")
+            completion_block = robot_world.step({
+                "command": {"type": "move", "direction": "forward", "distance": 1.0},
+                "job_id": robot_world.state.get('last_job_id'),
+                "status": "completed",
+                "player": "player1"
+            })
+            print(f"   Robot completion block: {completion_block.id[:8]}...")
+        
+        # D) Final results
+        time.sleep(0.1)  # Let reward process
+        print(f"\n5. Pipeline results:")
+        print(f"   Reward total issued: {reward_world.state.get('total_rewards_issued', 0):.2f}")
+        print(f"   Final balance: {persistence.wallet('player1'):.2f}")
+        print(f"   Net change: {persistence.wallet('player1') - initial_balance:.2f}")
+    
+    # 5) Energy → Flywheel pipeline demo
+    if features["enable_energy_world"] and features["enable_flywheel_world"]:
+        print("\n" + "="*60)
+        print("DEMONSTRATING ENERGY → FLYWHEEL PIPELINE")
+        print("="*60)
+        
+        energy_world = carrier.get("EnergyHarvesterWorld")
+        flywheel_world = carrier.get("FlywheelPlantWorld")
+        
+        if energy_world and flywheel_world:
+            print(f"\n1. Initial flywheel energy: {flywheel_world.state.get('stored_kwh', 0):.2f} kWh")
+            print(f"   Initial flywheel RPM: {flywheel_world.state.get('rpm', 0):.0f}")
+            
+            print("\n2. Energy harvester produces 5.0 kWh...")
+            energy_block = energy_world.step({"energy_produced_kwh": 5.0})
+            print(f"   Energy block: {energy_block.id[:8]}...")
+            
+            time.sleep(0.1)  # Let pipeline process
+            
+            print(f"\n3. After pipeline:")
+            print(f"   Flywheel energy: {flywheel_world.state.get('stored_kwh', 0):.2f} kWh")
+            print(f"   Flywheel RPM: {flywheel_world.state.get('rpm', 0):.0f}")
+            print(f"   Total energy harvested: {energy_world.state.get('total_kwh', 0):.2f} kWh")
+    
+    print("\n" + "="*60)
+    print("SYSTEM READY")
+    print("="*60)
+    
+    # 6) Optionally run FastAPI server
+    if FASTAPI_AVAILABLE and features.get("enable_fastapi_server", True):
+        app = build_fastapi_app(carrier, persistence, features)
+        print("\n[SERVER] Starting FastAPI server at http://0.0.0.0:8080")
+        print("[SERVER] API Endpoints:")
+        print("  GET  /                    - System status")
+        print("  GET  /health              - Health check")
+        print("  GET  /config              - Configuration")
+        print("  GET  /wallet/{pid}        - Check balance")
+        print("  POST /worlds/{name}/step  - Execute world action")
+        print("  GET  /worlds/{name}/state - Get world state")
+        print("  POST /toggle/{feature}    - Toggle feature")
+        print("  POST /omni/route          - Route through OmniWorld")
+        print("  WS   /ws                  - Live block stream")
+        print("\nPress Ctrl+C to stop server")
+        uvicorn.run(app, host="0.0.0.0", port=8080, log_level="info")
+    else:
+        print("\n[SERVER] FastAPI server disabled or dependency not available.")
+        print("[DONE] CLI demo completed.")
+        print("\nTo run with server, install: pip install fastapi uvicorn")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,184 +1,90 @@
-Atomic World Chronicle v3.7
+# Atomic World Chronicle v3.7
 
-**A world you want — or a world of worlds.**
-
-Atomic Chronicle v4.0 is an **append-only execution and memory substrate** that records actions, state transitions, and outcomes across time. It hosts multiple independent "worlds" (simulations, robotics, economies, games) that can interact while preserving perfect historical fidelity.
-
-> *It preserves what happened, not why it should have happened.*
+**A world you want — or a world of worlds.** Atomic Chronicle is an append-only execution and memory substrate that records every action, state transition, and outcome with perfect historical fidelity. It hosts multiple independent "worlds" (simulations, robotics, economies, games) that interact seamlessly while preserving immutable history.
 
 ## ✨ Features
-
-- **Multi-World Architecture**: Run games, robots, energy systems, DAOs simultaneously
-- **Inter-World Causality**: GameControl → RobotWorld → RewardWorld pipelines
-- **Transparency Economy**: Rewards discovery of unknown entities
-- **Physical Integration**: Serial control for real robots/vehicles
-- **VR/Gamepad Ready**: Human input → structured commands
-- **FastAPI/WebSocket**: Live control and streaming
-- **Offline-Capable**: Single file, no external dependencies required
-- **Feature Toggles**: Enable/disable worlds via config/CLI/API
+- **Immutable State Tracking**: Append-only ledger captures all changes across worlds for verifiable history.
+- **Cross-World Interactions**: Game outcomes trigger robot actions; economies reward simulations (e.g., game → robot → reward pipeline).
+- **Hardware Integration**: Direct robotics control with logged outcomes for real-world prototyping.
+- **FastAPI Endpoints**: Query states, transitions, and economies via REST API.
+- **Transparency Economy**: Verifiable rewards and transactions across simulations.
 
 ## 🏗️ Architecture Overview
-
-```
-GameControlWorld ──→ RobotWorld ──→ RewardWorld
-     ↓                    ↓              ↓
-EnergyHarvester ──→ FlywheelPlant     OmniWorld (Meta-Control)
-     ↓
-PublicCommons ←→ PrivateConsortium ← TransparencyEconomy
-     ↓
-     └─→ Atomic Chronicle Core (Blocks + RUS Validation)
-```
+Core is a persistent memory substrate (see [persistent-memory-substrate demo](https://jaronkbragg7337.github.io/persistent-memory-substrate/)). Worlds run independently but share atomic logs for interactions. Built for robotics, energy harvesting sims, and AI economies.
 
 ## 🚀 Quick Start
-
 ### Prerequisites
-- Python 3.7+
-- (Optional) `pygame`, `pyserial`, `fastapi[all]` for full features
+- Python 3.10+
+- `pip install fastapi uvicorn`
 
-## 🎮 Demo: Game → Robot → Reward Pipeline
-
-1. **Player plays Asteroids** (or sends gamepad input)
-2. **GameControlWorld** translates to robot commands
-3. **RobotWorld** executes (simulated or real hardware via serial)
-4. **RewardWorld** pays player tokens on success
-
-```python
-# Example: Send game command
-game_control.step({"action": "move_forward", "distance": 1.0})
-
-# Carrier automatically routes: Game → Robot → Reward
+### Run
+```bash
+git clone https://github.com/JaronKBragg7337/Atomic-World-Chronicle-3.7
+cd Atomic-World-Chronicle-3.7
+python "ATOM Code 3.7"  # Or main script
+uvicorn main:app --reload  # For API
 ```
+Access at `http://localhost:8000/docs` for API playground.
+
+## 🎮 Demo: Game → Robot → Reward
+1. Start game world: Player scores points.
+2. Triggers robot path: Executes hardware move.
+3. Logs reward: Transparent economy credits action.
+Query: `GET /worlds/game/state` shows full history.
 
 ## 🌍 Available Worlds
-
-| World | Domain | Purpose |
-|-------|--------|---------|
-| `EnergyHarvesterWorld` | Energy | Log harvested energy (solar/wind/piezo) |
-| `FlywheelPlantWorld` | Storage | Mechanical energy storage (RPM/kWh) |
-| `WindupGeneratorWorld` | Mechanics | Spring-based generator simulation |
-| `AsteroidsGameWorld` | Gaming | Classic asteroids with score/leveling |
-| `GameControlWorld` | Control | Gamepad → robot command translation |
-| `RobotWorld` | Robotics | Serial control for real hardware |
-| `RewardWorld` | Economy | Token rewards for completed jobs |
-| `MysteryTechnologyWorld` | Research | Unknown tech discovery mechanics |
-| `PublicCommonsWorld` | Social | Open knowledge sharing |
-| `PrivateConsortiumWorld` | DAO | Private proposals/voting |
-| `OmniWorld` | Meta | Route/toggle any world |
+- **Game World**: Simple physics sim with scoring.
+- **Robot World**: GPIO/serial integration for actuators.
+- **Economy World**: Token rewards with blockchain-like transparency.
 
 ## 💰 Transparency Economy
-
-- **Register entities** (tech, robots, data) as `public`/`private`/`unknown`
-- **Discovery rewards**: Reveal mysteries → earn tokens
-- **Commercial rights**: Public entities generate license fees
-- **Reputation system**: Transparency = earning multiplier
-
-```python
-# Register mystery tech
-te = TransparencyEconomy()
-reg = te.transparency.register_entity("mystery_device", "unknown")
-
-# Attempt reveal for rewards
-result = te.reveal_entity("mystery_device", "researcher", evidence={"scan_data": "..."})
-```
+All rewards are append-only tokens verifiable across worlds. Ideal for energy harvesting prototypes tracking output vs. rewards.
 
 ## 🔧 Configuration
-
-Create `atomic_chronicle_config.json`:
-```json
-{
-  "enable_robot_world": true,
-  "enable_fastapi_server": true,
-  "enable_omni_world": true
-}
-```
-
-CLI overrides:
-```bash
-python atomic_chronicle_v4.py --set-feature enable_game_world=false --no-server
+Edit `config.yaml`:
+```yaml
+worlds:
+  game: {gravity: 9.8}
+  robot: {port: /dev/ttyUSB0}
+economy: {reward_rate: 0.01}
 ```
 
 ## 📖 API Endpoints (FastAPI)
-
-| Endpoint | Description |
-|----------|-------------|
-| `GET /` | System status + world list |
-| `POST /world/{name}/step` | Execute action in specific world |
-| `GET /world/{name}/chain` | Retrieve world blockchain |
-| `WS /ws` | Live block stream |
-| `POST /omni/route` | OmniWorld command routing |
-
-## 🧪 Development
-
-```bash
-# Run tests
-python -m pytest tests/
-
-# Lint
-flake8 atomic_chronicle_v4.py
-
-# Generate docs
-pydoc-markdown atomic_chronicle_v4.py > API.md
-```
+| Endpoint | Description | Example |
+|----------|-------------|---------|
+| `/worlds/{name}/state` | Get world state  | `curl http://localhost:8000/worlds/game/state` |
+| `/action` | Execute cross-world action  | POST JSON: `{"from": "game", "to": "robot", "data": {...}}` |
+| `/history/{world}` | Query full log | Immutable append-only chain. |
 
 ## 🤖 Hardware Integration
+Supports Raspberry Pi/Arduino via serial. Example: Piezoelectric energy harvest → robot move → logged reward.
 
-Connect real robot:
-```bash
-# Edit RobotWorld port
-python atomic_chronicle_v4.py --set-feature enable_robot_world=true
-```
-
-Supported: Serial (USB), future: Network, CAN bus, ROS2
-
-## 📚 Philosophy
-
-Atomic Chronicle embodies **existential equality**:
-> *I am not higher or below any other entity. We create equal opportunity.*
-
-- **Neutral substrate**: No moral judgment of actions
-- **Perfect memory**: Every outcome preserved forever
-- **Rediscoverable**: Future civilizations can reconstruct history
-- **Multi-reality**: Each world defines its own physics/economics
+## 🧪 Development
+- Add worlds in `worlds/` folder.
+- Test: `pytest tests/`
+- Contribute: Fork, PR with atomic logs.
 
 ## 🛤️ Roadmap
-
-- [x] Core block ledger + RUS validation
-- [x] Multi-world architecture + Carrier
-- [x] Game→Robot→Reward pipeline
-- [x] Transparency Economy
-- [x] FastAPI/WebSocket interface
-- [ ] VR/AR integration
-- [ ] Distributed carrier (P2P)
-- [ ] Hardware wallet integration
-- [ ] Mobile app controller
-
-## 🤝 Contributing
-
-1. Fork the repo
-2. Create feature branch (`git checkout -b feature/AmazingWorld`)
-3. Commit changes (`git commit -m 'Add AmazingWorld'`)
-4. Push (`git push origin feature/AmazingWorld`)
-5. Open Pull Request
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
+- v3.7: Multi-node clustering.
+- Blockchain bridge for economies.
+- Soft robotics + energy harvesting worlds.
 
 ## 📄 License
-
-MIT License - see [LICENSE](LICENSE) file.
+MIT License — free to build worlds!
 
 ## 🙏 Acknowledgments
+Built for inventors prototyping the future. ⭐ Star if useful!
 
-- Built for long-term continuity and rediscoverability
-- Inspired by blockchain immutability + simulation theory
-- Designed for physical-digital convergence
+**🧑‍💻 Author**: JaronKBragg7337 (Fort Wayne, IN) — Energy harvesting, robotics, space tech enthusiast.
 
-## 🧑‍💻 Author
+Atomic-World-Chronicle-3.7 https://github.com/JaronKBragg7337/Atomic-World-Chronicle-3.7
+
 
 **Jaron Kyler Bragg**  
 [GitHub](https://github.com/jaronkbragg7337) | [LinkedIn](https://linkedin.com/in/YOUR_PROFILE)
 https://jaronkbragg7337.github.io/persistent-memory-substrate/
 ***
-4.0 is OLD version USE 3.7 (yes backwards) (https://github.com/JaronKBragg7337/ATOMIC-CHRONICLE-v4.0-A-World-You-Want-Or-a-World-of-Worlds)
+(https://github.com/JaronKBragg7337/ATOMIC-CHRONICLE-v4.0-A-World-You-Want-Or-a-World-of-Worlds)
 A-World-You-Want-Or-a-World-of-Worlds
 *⭐ Star this repo if you find it useful!*
 

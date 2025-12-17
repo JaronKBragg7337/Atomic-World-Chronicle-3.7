@@ -1,4 +1,4 @@
-# Atomic World Chronicle v3.7
+Atomic World Chronicle v3.7
 
 **A world you want — or a world of worlds.**
 
